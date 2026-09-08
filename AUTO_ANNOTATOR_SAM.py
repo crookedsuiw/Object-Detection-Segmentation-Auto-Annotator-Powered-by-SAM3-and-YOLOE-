@@ -617,7 +617,7 @@ class AnnotatorApp:
 
     def run_sam3_bulk(self):
         prog_win = tk.Toplevel(self.root)
-        prog_win.title("SAM3 Semantic Labeling")
+        prog_win.title("Open Vocabulary Labeling")
         prog_win.geometry("450x180")
         
         lbl = tk.Label(prog_win, text="Initializing SAM3...", pady=10, font=("Segoe UI", 10))
@@ -628,25 +628,30 @@ class AnnotatorApp:
         
         def task():
             try:
-                from ultralytics.models.sam import SAM3SemanticPredictor
                 import torch
                 model_path = self.sam3_config.get("model_path", "sam3.pt")
                 if not model_path.endswith('.pt') and not model_path.endswith('.pth') and not model_path.endswith('.engine'):
                     model_path += '.pt'
                 quant = self.sam3_config.get("quantization", "float16")
+                model_type = self.sam3_config.get("model_type", "SAM3")
                 
                 lbl.config(text=f"Loading {model_path} into memory...")
                 prog_win.update()
                 
-                overrides = {
-                    "model": model_path,
-                    "task": "segment",
-                    "mode": "predict",
-                    "conf": 0.5,
-                    "imgsz": 644,
-                    "half": (quant == "float16")
-                }
-                predictor = SAM3SemanticPredictor(overrides=overrides)
+                if model_type == "YOLOE":
+                    from ultralytics import YOLO
+                    predictor = YOLO(model_path)
+                else:
+                    from ultralytics.models.sam import SAM3SemanticPredictor
+                    overrides = {
+                        "model": model_path,
+                        "task": "segment",
+                        "mode": "predict",
+                        "conf": 0.5,
+                        "imgsz": 644,
+                        "half": (quant == "float16")
+                    }
+                    predictor = SAM3SemanticPredictor(overrides=overrides)
                 
                 total = len(self.image_paths)
                 progress["maximum"] = total
@@ -671,7 +676,11 @@ class AnnotatorApp:
                     for chunk in chunks:
                         prompts = [pmt for pmt, base_cls in chunk]
                         with torch.no_grad():
-                            res = predictor(img, text=prompts)
+                            if model_type == "YOLOE":
+                                predictor.set_classes(prompts)
+                                res = predictor(img, verbose=True)
+                            else:
+                                res = predictor(img, text=prompts)
                             
                         for r in res:
                             has_masks = r.masks is not None
@@ -1741,7 +1750,7 @@ class StartupGUI:
 
         self.use_sam3_var = tk.BooleanVar(value=False)
         self.sam3_config = None
-        tk.Checkbutton(self.root, text="Use SAM3 Semantic", variable=self.use_sam3_var, command=self.on_sam3_check, font=("Arial", 10, "bold")).pack(anchor="w", padx=10, pady=5)
+        tk.Checkbutton(self.root, text="Annotate with Open Vocabulary (SAM3 & YOLOE)", variable=self.use_sam3_var, command=self.on_sam3_check, font=("Arial", 10, "bold")).pack(anchor="w", padx=10, pady=5)
 
         tk.Button(self.root, text="Start Annotation", bg="#4CAF50", fg="white",
                   command=self.launch, font=("Arial", 12, "bold")).pack(pady=10)
@@ -1753,7 +1762,7 @@ class StartupGUI:
 
     def on_sam3_check(self):
         if self.use_sam3_var.get():
-            SAM3Dialog(self)
+            OpenVocabDialog(self)
         else:
             self.sam3_config = None
 
@@ -2239,16 +2248,29 @@ class FlorenceDialog(tk.Toplevel):
         self.lbl_progress.config(text="Done!")
         self.annotator.load_image(self.annotator.index)
 
-class SAM3Dialog(tk.Toplevel):
+class OpenVocabDialog(tk.Toplevel):
     def __init__(self, startup_gui):
         super().__init__(startup_gui.root)
         self.startup_gui = startup_gui
-        self.title("SAM3 Semantic Configuration")
+        self.title("Open Vocabulary Configuration")
         self.geometry("500x350")
         
         self.transient(startup_gui.root)
         self.grab_set()
         
+        f0 = tk.Frame(self)
+        f0.pack(fill=tk.X, padx=10, pady=5)
+        tk.Label(f0, text="Model Architecture:").pack(side=tk.LEFT)
+        self.model_type_var = tk.StringVar(value="YOLOE")
+        def on_model_type_change():
+            if self.model_type_var.get() == "YOLOE":
+                self.quant_var.set("float32")
+            else:
+                self.quant_var.set("float16")
+                
+        tk.Radiobutton(f0, text="YOLOE", variable=self.model_type_var, value="YOLOE", command=on_model_type_change).pack(side=tk.LEFT, padx=5)
+        tk.Radiobutton(f0, text="SAM3", variable=self.model_type_var, value="SAM3", command=on_model_type_change).pack(side=tk.LEFT, padx=5)
+
         f1 = tk.Frame(self)
         f1.pack(fill=tk.X, padx=10, pady=5)
         tk.Label(f1, text="Model Path:").pack(side=tk.LEFT)
@@ -2266,7 +2288,7 @@ class SAM3Dialog(tk.Toplevel):
         f3 = tk.Frame(self)
         f3.pack(fill=tk.X, padx=10, pady=5)
         tk.Label(f3, text="Quantization:").pack(side=tk.LEFT)
-        self.quant_var = tk.StringVar(value="float16")
+        self.quant_var = tk.StringVar(value="float32" if self.model_type_var.get() == "YOLOE" else "float16")
         tk.OptionMenu(f3, self.quant_var, "bfloat16", "float16",  "int8", "float32").pack(side=tk.LEFT, padx=5)
         
         f3_5 = tk.Frame(self)
@@ -2373,6 +2395,7 @@ class SAM3Dialog(tk.Toplevel):
             
     def save_close(self):
         self.startup_gui.sam3_config = {
+            "model_type": self.model_type_var.get(),
             "model_path": self.model_var.get(),
             "save_format": self.format_var.get(),
             "quantization": self.quant_var.get(),
@@ -2415,23 +2438,26 @@ class SAM3Dialog(tk.Toplevel):
         
         def run():
             try:
-                from ultralytics.models.sam import SAM3SemanticPredictor
                 import torch
-                
                 model_path = self.model_var.get().strip()
                 if not model_path.endswith('.pt') and not model_path.endswith('.pth') and not model_path.endswith('.engine'):
                     model_path += '.pt'
                 quant = self.quant_var.get()
-                
-                overrides = {
-                    "model": model_path,
-                    "task": "segment",
-                    "mode": "predict",
-                    "conf": 0.5,
-                    "imgsz": 644,
-                    "half": (quant == "float16")
-                }
-                predictor = SAM3SemanticPredictor(overrides=overrides)
+                model_type = self.model_type_var.get()
+                if model_type == "YOLOE":
+                    from ultralytics import YOLO
+                    predictor = YOLO(model_path)
+                else:
+                    from ultralytics.models.sam import SAM3SemanticPredictor
+                    overrides = {
+                        "model": model_path,
+                        "task": "segment",
+                        "mode": "predict",
+                        "conf": 0.5,
+                        "imgsz": 644,
+                        "half": (quant == "float16")
+                    }
+                    predictor = SAM3SemanticPredictor(overrides=overrides)
                 
                 total_elapsed = 0
                 valid_elapsed_count = 0
@@ -2455,7 +2481,11 @@ class SAM3Dialog(tk.Toplevel):
                     for chunk in chunks:
                         prompts = [p for p, b in chunk]
                         with torch.no_grad():
-                            res = predictor(img, text=prompts)
+                            if model_type == "YOLOE":
+                                predictor.set_classes(prompts)
+                                res = predictor(img, verbose=False)
+                            else:
+                                res = predictor(img, text=prompts)
                             
                         if res and hasattr(res[0], 'speed') and isinstance(res[0].speed, dict):
                             frame_elapsed += sum(res[0].speed.values()) / 1000.0
