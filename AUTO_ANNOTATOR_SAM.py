@@ -492,7 +492,8 @@ def match_box_via_template(prev_img_gray, curr_img_gray, box, search_margin=1.5)
 
 # =========================== ANNOTATION APP ===========================
 class AnnotatorApp:
-    def __init__(self, master, image_folder, img_out, label_out, classes, model_wrapper=None, yolo_save_format="bbox", sam3_config=None):
+    def __init__(self, master, image_folder, img_out, label_out, classes, model_wrapper=None, yolo_save_format="bbox", sam3_config=None, yolo_bulk_config=None):
+        self.yolo_bulk_config = yolo_bulk_config
         self.image_folder = image_folder
         self.img_out = img_out
         self.label_out = label_out
@@ -562,9 +563,6 @@ class AnnotatorApp:
 
         self.class_select_btn = tk.Button(ctrl_frame, text="Select Auto-Annotate Classes", command=self.open_class_selection_dialog)
         self.class_select_btn.pack(side=tk.LEFT, padx=6)
-        
-        self.florence_btn = tk.Button(ctrl_frame, text="Annotate with LLM (Florence)", command=self.open_florence_dialog)
-        self.florence_btn.pack(side=tk.LEFT, padx=6)
 
         self.canvas = tk.Canvas(self.root, bg="black", width=1280, height=720, cursor="tcross")
         self.canvas.pack(fill=tk.BOTH, expand=True)
@@ -610,6 +608,8 @@ class AnnotatorApp:
         
         if self.sam3_config:
             self.root.after(100, self.run_sam3_bulk)
+        elif self.yolo_bulk_config:
+            self.root.after(100, self.run_standard_yolo_bulk)
         else:
             self._safe_load_image(0)
             
@@ -1129,6 +1129,118 @@ class AnnotatorApp:
         return inside
 
     # ------------------- Actions -------------------
+
+    def run_standard_yolo_bulk(self):
+        import tkinter as tk
+        from tkinter import ttk
+        import os
+        import time
+        from PIL import Image
+        import torch
+        from ultralytics import YOLO
+        
+        prog_win = tk.Toplevel(self.root)
+        prog_win.title("Standard YOLO Labeling")
+        prog_win.geometry("450x180")
+        
+        lbl = tk.Label(prog_win, text="Initializing YOLO...", pady=10, font=("Segoe UI", 10))
+        lbl.pack()
+        
+        progress = ttk.Progressbar(prog_win, orient="horizontal", length=350, mode="determinate")
+        progress.pack(pady=10)
+        
+        def task():
+            try:
+                model_path = self.yolo_bulk_config.get("model_path")
+                conf_thresh = self.yolo_bulk_config.get("conf", 0.5)
+                mapping = self.yolo_bulk_config.get("mapping", {})
+                
+                lbl.config(text=f"Loading {os.path.basename(model_path)} into memory...")
+                prog_win.update()
+                
+                model = YOLO(model_path)
+                
+                total = len(self.image_paths)
+                progress["maximum"] = total
+                
+                for i, p in enumerate(self.image_paths):
+                    lbl.config(text=f"Labeling {i+1} / {total}\n{os.path.basename(p)}")
+                    img = Image.open(p).convert("RGB")
+                    w, h = img.size
+                    
+                    with torch.no_grad():
+                        res = model(img, conf=conf_thresh, verbose=False)
+                        
+                    new_boxes = []
+                    r = res[0]
+                    has_masks = r.masks is not None
+                    
+                    if r.boxes:
+                        bxyxy = r.boxes.xyxy.cpu().numpy()
+                        bcls = r.boxes.cls.cpu().numpy()
+                        bconf = r.boxes.conf.cpu().numpy()
+                        segments = r.masks.xy if has_masks else []
+                        
+                        for idx in range(len(bxyxy)):
+                            m_cls_name = model.names[int(bcls[idx])]
+                            if m_cls_name in mapping:
+                                target = mapping[m_cls_name]
+                                if target in self.classes:
+                                    c_idx = self.classes.index(target)
+                                    x1, y1, x2, y2 = bxyxy[idx]
+                                    
+                                    # Apply global shifts
+                                    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                                    bw, bh = (x2 - x1) * self.global_resize_mult, (y2 - y1) * self.global_resize_mult
+                                    cx += getattr(self, 'global_shift_x', 0.0)
+                                    cy += getattr(self, 'global_shift_y', 0.0)
+                                    
+                                    nx1, ny1, nx2, ny2 = int(cx - bw/2.0), int(cy - bh/2.0), int(cx + bw/2.0), int(cy + bh/2.0)
+                                    nx1, ny1 = max(0, nx1), max(0, ny1)
+                                    nx2, ny2 = min(w, nx2), min(h, ny2)
+                                    
+                                    box_data = {'class': c_idx, 'x1': float(nx1), 'y1': float(ny1), 'x2': float(nx2), 'y2': float(ny2)}
+                                    
+                                    if has_masks and idx < len(segments):
+                                        poly = segments[idx].tolist()
+                                        if poly: box_data['poly'] = poly
+                                        
+                                    new_boxes.append(box_data)
+                                    
+                    base = os.path.splitext(os.path.basename(p))[0]
+                    lpath = os.path.join(self.label_out, base + ".txt")
+                    
+                    existing_boxes = load_yolo_labels(lpath, w, h)
+                    
+                    # Merge existing boxes and new boxes
+                    for nb in new_boxes:
+                        existing_boxes.append(nb)
+                        
+                    save_yolo_labels(lpath, existing_boxes, w, h)
+                    
+                    import shutil
+                    shutil.copy2(p, os.path.join(self.img_out, os.path.basename(p)))
+                    
+                    progress["value"] = i + 1
+                    prog_win.update_idletasks()
+                    
+                lbl.config(text="Done!")
+                prog_win.destroy()
+                
+                del model
+                if 'torch' in sys.modules:
+                    sys.modules['torch'].cuda.empty_cache()
+                    
+                self._safe_load_image(0)
+                
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                lbl.config(text=f"Error: {e}")
+                
+        import threading
+        threading.Thread(target=task, daemon=True).start()
+
     def save_labels(self, event=None):
         to_save = []
         for b in self.boxes:
@@ -1523,9 +1635,6 @@ class AnnotatorApp:
         tk.Button(btn_frame, text="OK", command=on_ok).pack(side=tk.LEFT, padx=8)
         tk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side=tk.LEFT, padx=8)
 
-    def open_florence_dialog(self):
-        FlorenceDialog(self)
-
 # =========================== STARTUP GUI (with Video Splitter page) ===========================
 class VideoSplitterGUI:
     def __init__(self, master=None):
@@ -1743,14 +1852,18 @@ class StartupGUI:
         self.make_path_input("Input Images Folder", self.img_dir, self.browse_images)
         self.make_path_input("Output Images Folder", self.out_img_dir, self.browse_out_images)
         self.make_path_input("Output Labels Folder", self.out_label_dir, self.browse_out_labels)
-        self.make_path_input("Model (.pt) File (YOLOv8/v11)", self.model_path, self.browse_model)
+        
 
         tk.Label(self.root, text="Class names (comma separated):").pack(anchor="w", padx=10)
         tk.Entry(self.root, textvariable=self.classes_str, width=50).pack(padx=10, pady=5)
 
         self.use_sam3_var = tk.BooleanVar(value=False)
         self.sam3_config = None
+        self.use_yolo_bulk_var = tk.BooleanVar(value=False)
+        self.yolo_bulk_config = None
+        
         tk.Checkbutton(self.root, text="Annotate with Open Vocabulary (SAM3 & YOLOE)", variable=self.use_sam3_var, command=self.on_sam3_check, font=("Arial", 10, "bold")).pack(anchor="w", padx=10, pady=5)
+        tk.Checkbutton(self.root, text="Annotate with standard YOLO", variable=self.use_yolo_bulk_var, command=self.on_yolo_bulk_check, font=("Arial", 10, "bold")).pack(anchor="w", padx=10, pady=5)
 
         tk.Button(self.root, text="Start Annotation", bg="#4CAF50", fg="white",
                   command=self.launch, font=("Arial", 12, "bold")).pack(pady=10)
@@ -1759,6 +1872,12 @@ class StartupGUI:
                   command=self.open_video_splitter, font=("Arial", 10)).pack(pady=5)
 
         self.root.mainloop()
+
+    def on_yolo_bulk_check(self):
+        if self.use_yolo_bulk_var.get():
+            StandardYoloDialog(self)
+        else:
+            self.yolo_bulk_config = None
 
     def on_sam3_check(self):
         if self.use_sam3_var.get():
@@ -1807,13 +1926,16 @@ class StartupGUI:
         model_wrapper = None
         if self.use_sam3_var.get() and self.sam3_config:
             yolo_save_format = self.sam3_config.get("save_format", "bbox")
-        elif model_p:
+        elif self.use_yolo_bulk_var.get() and self.yolo_bulk_config:
+            yolo_save_format = self.yolo_bulk_config.get("save_format", "bbox")
+        # NOTE: ModelWrapper init for manual annotation using standard YOLO without bulk
+        elif model_p and not self.use_yolo_bulk_var.get() and not self.use_sam3_var.get():
             model_wrapper = ModelWrapper(model_p)
             if not model_wrapper.ready:
                 messagebox.showwarning("Warning", "Failed to load model. Running without auto-annotation.")
 
         self.root.withdraw()
-        AnnotatorApp(self.root, images, out_img, out_label, classes, model_wrapper, yolo_save_format=yolo_save_format, sam3_config=self.sam3_config)
+        AnnotatorApp(self.root, images, out_img, out_label, classes, model_wrapper, yolo_save_format=yolo_save_format, sam3_config=self.sam3_config, yolo_bulk_config=self.yolo_bulk_config)
 
 # =========================== FLORENCE AND GLOBAL ADJUSTER ===========================
 import random
@@ -1898,11 +2020,240 @@ class GlobalBoxAdjuster(tk.Toplevel):
         messagebox.showinfo("Done", f"Adjusted boxes in {count + 1} labeled images.")
         self.destroy()
 
+
+class StandardYoloDialog(tk.Toplevel):
+    def __init__(self, startup_gui):
+        super().__init__(startup_gui.root)
+        self.startup_gui = startup_gui
+        self.title("Standard YOLO Bulk Configuration")
+        self.geometry("600x550")
+        self.transient(startup_gui.root)
+        self.grab_set()
+        
+        self.model_class_names = []
+        self.mapping_vars = {}
+        
+        f1 = tk.Frame(self)
+        f1.pack(fill=tk.X, padx=10, pady=5)
+        tk.Label(f1, text="YOLO Model Path:").pack(side=tk.LEFT)
+        self.model_var = tk.StringVar()
+        tk.Entry(f1, textvariable=self.model_var, width=35).pack(side=tk.LEFT, padx=5)
+        tk.Button(f1, text="Browse", command=self.browse_model).pack(side=tk.LEFT, padx=5)
+        tk.Button(f1, text="Fetch Classes", command=self.fetch_classes, bg="orange").pack(side=tk.LEFT)
+        
+        f2 = tk.Frame(self)
+        f2.pack(fill=tk.X, padx=10, pady=5)
+        tk.Label(f2, text="Save Format:").pack(side=tk.LEFT)
+        self.format_var = tk.StringVar(value="bbox")
+        tk.Radiobutton(f2, text="Bounding Box", variable=self.format_var, value="bbox").pack(side=tk.LEFT)
+        tk.Radiobutton(f2, text="Polygon", variable=self.format_var, value="polygon").pack(side=tk.LEFT)
+        
+        f3 = tk.Frame(self)
+        f3.pack(fill=tk.X, padx=10, pady=5)
+        tk.Label(f3, text="Conf Threshold:").pack(side=tk.LEFT)
+        self.conf_var = tk.DoubleVar(value=0.5)
+        tk.Scale(f3, variable=self.conf_var, from_=0.01, to=1.0, resolution=0.01, orient=tk.HORIZONTAL, length=200).pack(side=tk.LEFT, padx=5)
+        
+        lbl = tk.Label(self, text="Map Model Classes to Target Classes:", font=("Arial", 10, "bold"))
+        lbl.pack(padx=10, pady=(10, 0), anchor="w")
+        
+        self.container = tk.Frame(self)
+        self.container.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        self.canvas = tk.Canvas(self.container)
+        self.scrollbar = tk.Scrollbar(self.container, orient="vertical", command=self.canvas.yview)
+        self.scroll_frame = tk.Frame(self.canvas)
+        
+        self.scroll_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.create_window((0, 0), window=self.scroll_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar.pack(side="right", fill="y")
+        
+        f4 = tk.Frame(self)
+        f4.pack(fill=tk.X, padx=10, pady=5)
+        tk.Label(f4, text="Random Frames:").pack(side=tk.LEFT)
+        self.test_n_var = tk.StringVar(value="3")
+        tk.Entry(f4, textvariable=self.test_n_var, width=5).pack(side=tk.LEFT, padx=5)
+        tk.Button(f4, text="Test Inference", command=self.test_inference, bg="#2196F3", fg="white").pack(side=tk.LEFT, padx=10)
+        
+        self.eta_label = tk.Label(self, text="ETA: --", fg="blue")
+        self.eta_label.pack()
+        
+        tk.Button(self, text="Save & Close", command=self.save_close, bg="#4CAF50", fg="white", font=("Arial", 10, "bold")).pack(pady=10)
+        
+    def browse_model(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(parent=self, title="Select YOLO Model", filetypes=[("Models", "*.pt *.pth *.engine"), ("All", "*.*")])
+        if path:
+            self.model_var.set(path)
+            self.fetch_classes()
+            
+    def fetch_classes(self):
+        model_path = self.model_var.get().strip()
+        if not model_path:
+            from tkinter import messagebox
+            messagebox.showerror("Error", "Please select a model first.", parent=self)
+            return
+        try:
+            from ultralytics import YOLO
+            m = YOLO(model_path)
+            names = m.names
+            if isinstance(names, dict):
+                self.model_class_names = list(names.values())
+            else:
+                self.model_class_names = list(names)
+            del m
+            self.build_mapping_ui()
+        except Exception as e:
+            from tkinter import messagebox
+            messagebox.showerror("Error", f"Failed to load classes: {e}", parent=self)
+            
+    def build_mapping_ui(self):
+        for widget in self.scroll_frame.winfo_children():
+            widget.destroy()
+        
+        target_classes = [c.strip() for c in self.startup_gui.classes_str.get().split(",") if c.strip()]
+        target_options = ["(Ignore)"] + target_classes
+        
+        self.mapping_vars = {}
+        for cname in self.model_class_names:
+            f = tk.Frame(self.scroll_frame)
+            f.pack(fill=tk.X, pady=2)
+            tk.Label(f, text=cname, width=25, anchor="w").pack(side=tk.LEFT)
+            
+            var = tk.StringVar()
+            
+            matched_target = "(Ignore)"
+            for tc in target_classes:
+                if cname.lower() == tc.lower():
+                    matched_target = tc
+                    break
+                    
+            var.set(matched_target)
+            self.mapping_vars[cname] = var
+            tk.OptionMenu(f, var, *target_options).pack(side=tk.LEFT)
+            
+    def save_close(self):
+        mapping = {}
+        for cname, var in self.mapping_vars.items():
+            val = var.get()
+            if val != "(Ignore)":
+                mapping[cname] = val
+                
+        self.startup_gui.yolo_bulk_config = {
+            "model_path": self.model_var.get().strip(),
+            "save_format": self.format_var.get(),
+            "conf": self.conf_var.get(),
+            "mapping": mapping
+        }
+        self.destroy()
+
+    def test_inference(self):
+        img_dir = self.startup_gui.img_dir.get().strip()
+        if not img_dir or not os.path.exists(img_dir):
+            messagebox.showerror("Error", "Select input image folder first.")
+            return
+            
+        import glob
+        images = []
+        for e in ("*.jpg", "*.png", "*.jpeg", "*.bmp"):
+            images.extend(glob.glob(os.path.join(img_dir, e)))
+            
+        if not images:
+            messagebox.showerror("Error", "No images found in the selected folder.")
+            return
+            
+        try: n = int(self.test_n_var.get())
+        except: n = 1
+        
+        import random
+        img_paths = random.sample(images, min(n, len(images)))
+        
+        target_classes = [c.strip() for c in self.startup_gui.classes_str.get().split(",") if c.strip()]
+        
+        mapping = {}
+        for cname, var in self.mapping_vars.items():
+            val = var.get()
+            if val != "(Ignore)":
+                mapping[cname] = val
+                
+        if not mapping:
+            messagebox.showerror("Error", "Map at least one class.")
+            return
+            
+        self.eta_label.config(text=f"Running test inference on {len(img_paths)} frames...")
+        self.update_idletasks()
+        
+        def run():
+            try:
+                import torch
+                from ultralytics import YOLO
+                import time
+                from PIL import Image
+                
+                model_path = self.model_var.get().strip()
+                model = YOLO(model_path)
+                conf = self.conf_var.get()
+                
+                total_elapsed = 0
+                results = []
+                
+                for i, img_path in enumerate(img_paths):
+                    img = Image.open(img_path).convert("RGB")
+                    t0 = time.time()
+                    res = model(img, conf=conf, verbose=False)
+                    t1 = time.time()
+                    if i > 0 or len(img_paths) == 1:
+                        total_elapsed += (t1 - t0)
+                        
+                    boxes = []
+                    r = res[0]
+                    has_masks = r.masks is not None
+                    if r.boxes:
+                        bxyxy = r.boxes.xyxy.cpu().numpy()
+                        bcls = r.boxes.cls.cpu().numpy()
+                        bconf = r.boxes.conf.cpu().numpy()
+                        segments = r.masks.xy if has_masks else []
+                        for idx in range(len(bxyxy)):
+                            m_cls_name = model.names[int(bcls[idx])]
+                            if m_cls_name in mapping:
+                                target = mapping[m_cls_name]
+                                if target in target_classes:
+                                    c_idx = target_classes.index(target)
+                                    x1, y1, x2, y2 = bxyxy[idx]
+                                    box_data = {'class': c_idx, 'x1': float(x1), 'y1': float(y1), 'x2': float(x2), 'y2': float(y2), 'conf': float(bconf[idx])}
+                                    if has_masks and idx < len(segments):
+                                        poly = segments[idx].tolist()
+                                        if poly: box_data['poly'] = poly
+                                    boxes.append(box_data)
+                                    
+                    results.append((img_path, boxes))
+                    
+                avg_time = total_elapsed / max(1, len(img_paths) - 1 if len(img_paths)>1 else 1)
+                total_imgs = len(images)
+                est_total = avg_time * total_imgs
+                mins, secs = divmod(int(est_total), 60)
+                
+                self.eta_label.config(text=f"Test took {total_elapsed:.2f}s. Est. total for {total_imgs} images: {mins}m {secs}s")
+                del model
+                if 'torch' in sys.modules:
+                    sys.modules['torch'].cuda.empty_cache()
+                    
+                self.after(0, lambda: FlorenceTestViewer(self, results, target_classes))
+            except Exception as e:
+                self.eta_label.config(text=f"Error: {e}")
+                
+        import threading
+        threading.Thread(target=run, daemon=True).start()
+
+
 class FlorenceTestViewer(tk.Toplevel):
     def __init__(self, master, results, classes=None):
         super().__init__(master)
         self.classes = classes or []
-        self.title("Florence-2 Test Results")
+        self.title("Test Inference Results")
         self.geometry("1000x800")
         
         self.results = results
@@ -1951,6 +2302,11 @@ class FlorenceTestViewer(tk.Toplevel):
         self.shift_y_scale = tk.Scale(self.resize_frame, label="Shift Y", variable=self.shift_y_var, from_=-100, to=100, resolution=1, orient=tk.HORIZONTAL, command=on_val_change)
         self.shift_y_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         
+        self.conf_filter_var = tk.DoubleVar(value=0.0)
+        
+        self.conf_scale = tk.Scale(self.resize_frame, label="Min Conf", variable=self.conf_filter_var, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL, command=on_val_change)
+        self.conf_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
         self.load_current()
         
     def load_current(self):
@@ -1963,8 +2319,15 @@ class FlorenceTestViewer(tk.Toplevel):
         cv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
         
         palette = [(0, 255, 0), (255, 255, 0), (0, 255, 255), (255, 0, 255), (0, 165, 255), (0, 255, 127), (255, 191, 0), (0, 215, 255), (211, 0, 148)]
+        min_conf = getattr(self, 'conf_filter_var', None)
+        min_conf = min_conf.get() if min_conf else 0.0
+        
         for b in boxes:
             c_idx = b.get('class', 0)
+            conf = float(b.get('conf', 1.0))
+            if conf < min_conf:
+                continue
+                
             color = palette[c_idx % len(palette)]
             
             x1_o, y1_o, x2_o, y2_o = float(b['x1']), float(b['y1']), float(b['x2']), float(b['y2'])
@@ -1989,6 +2352,8 @@ class FlorenceTestViewer(tk.Toplevel):
             cv2.rectangle(cv_img, (x1, y1), (x2, y2), color, 2)
             
             name = self.classes[c_idx] if c_idx < len(self.classes) else str(c_idx)
+            if 'conf' in b:
+                name += f" {conf:.2f}"
             cv2.putText(cv_img, name, (x1, max(y1-5, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             
             if 'poly' in b and b['poly']:
@@ -2015,238 +2380,6 @@ class FlorenceTestViewer(tk.Toplevel):
         if self.current_idx > 0:
             self.current_idx -= 1
             self.load_current()
-
-class FlorenceDialog(tk.Toplevel):
-    def __init__(self, annotator):
-        super().__init__(annotator.root)
-        self.annotator = annotator
-        self.title("Annotate with Florence-2")
-        self.geometry("650x550")
-        
-        if not TRANSFORMERS_AVAILABLE:
-            messagebox.showerror("Missing Dependency", "Please install transformers, einops, and timm.")
-            self.destroy()
-            return
-            
-        self.cache_file = ".florence_prompts_cache.json"
-        self.history = self.load_history()
-        
-        self.processor = None
-        self.model = None
-        self.current_model_id = ""
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        
-        self.make_widgets()
-        
-    def load_history(self):
-        if os.path.exists(self.cache_file):
-            try:
-                with open(self.cache_file, "r") as f:
-                    return json.load(f)
-            except:
-                return []
-        return []
-        
-    def save_history(self, prompt):
-        if prompt not in self.history:
-            self.history.append(prompt)
-            with open(self.cache_file, "w") as f:
-                json.dump(self.history, f)
-                
-    def make_widgets(self):
-        f1 = tk.Frame(self)
-        f1.pack(fill=tk.X, padx=10, pady=5)
-        tk.Label(f1, text="Model:").pack(side=tk.LEFT)
-        self.model_var = tk.StringVar(value="Select Model...")
-        self.model_opts = [
-            "microsoft/Florence-2-base-ft", 
-            "microsoft/Florence-2-large-ft",
-            "microsoft/Florence-2-base",
-            "microsoft/Florence-2-large"
-        ]
-        self.model_menu = tk.OptionMenu(f1, self.model_var, *self.model_opts, command=self.on_model_select)
-        self.model_menu.pack(side=tk.LEFT, padx=5)
-        
-        self.eta_label = tk.Label(f1, text="ETA: --", fg="blue")
-        self.eta_label.pack(side=tk.LEFT, padx=10)
-        
-        f2 = tk.Frame(self)
-        f2.pack(fill=tk.X, padx=10, pady=5)
-        tk.Label(f2, text="Text Prompt:").pack(side=tk.LEFT)
-        self.prompt_var = tk.StringVar()
-        tk.Entry(f2, textvariable=self.prompt_var, width=35).pack(side=tk.LEFT, padx=5)
-        
-        tk.Label(f2, text="Class ID:").pack(side=tk.LEFT)
-        self.target_class_var = tk.StringVar(value="0")
-        tk.Entry(f2, textvariable=self.target_class_var, width=5).pack(side=tk.LEFT, padx=5)
-        
-        f3 = tk.Frame(self)
-        f3.pack(fill=tk.X, padx=10, pady=5)
-        tk.Label(f3, text="Previous Prompts:").pack(side=tk.LEFT)
-        self.hist_var = tk.StringVar(value="Select...")
-        hist_opts = self.history if self.history else ["(no history)"]
-        self.hist_menu = tk.OptionMenu(f3, self.hist_var, *hist_opts, command=self.on_hist_select)
-        self.hist_menu.pack(side=tk.LEFT, padx=5)
-        
-        f4 = tk.LabelFrame(self, text="Test Prompt")
-        f4.pack(fill=tk.X, padx=10, pady=10)
-        tk.Label(f4, text="Random Frames:").pack(side=tk.LEFT, padx=5)
-        self.test_n_var = tk.StringVar(value="3")
-        tk.Entry(f4, textvariable=self.test_n_var, width=5).pack(side=tk.LEFT, padx=5)
-        tk.Button(f4, text="Run Test", command=self.run_test).pack(side=tk.LEFT, padx=10)
-        
-        tk.Button(self, text="Open Global BBox Adjuster", command=lambda: GlobalBoxAdjuster(self.annotator)).pack(pady=5)
-        
-        self.progress = ttk.Progressbar(self, orient="horizontal", length=400, mode="determinate")
-        self.progress.pack(padx=10, pady=10)
-        
-        self.lbl_progress = tk.Label(self, text="Ready")
-        self.lbl_progress.pack(pady=2)
-        
-        tk.Button(self, text="Annotate Full Dataset", command=self.annotate_dataset, bg="#4CAF50", fg="white", font=("Arial", 12)).pack(pady=10)
-        
-    def on_hist_select(self, val):
-        if val != "(no history)":
-            self.prompt_var.set(val)
-            
-    def on_model_select(self, val):
-        self.eta_label.config(text="Loading model & benchmarking...")
-        self.update_idletasks()
-        threading.Thread(target=self._load_and_benchmark, args=(val,), daemon=True).start()
-        
-    def _load_and_benchmark(self, model_id):
-        if self.current_model_id != model_id:
-            try:
-                self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-                self.model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True).eval().to(self.device)
-                self.current_model_id = model_id
-            except Exception as e:
-                self.eta_label.config(text="Failed to load model")
-                print("Error loading florence:", e)
-                return
-                
-        if self.annotator.image_paths:
-            img = Image.open(self.annotator.image_paths[0]).convert("RGB")
-            start = time.time()
-            self._run_inference(img, "test")
-            elapsed = time.time() - start
-            
-            total_images = len(self.annotator.image_paths)
-            est_total = elapsed * total_images
-            mins, secs = divmod(int(est_total), 60)
-            self.eta_label.config(text=f"ETA for {total_images} imgs: {mins}m {secs}s (approx {elapsed:.2f}s/img)")
-            
-    def _run_inference(self, pil_image, prompt_text, task="<CAPTION_TO_PHRASE_GROUNDING>"):
-        if not self.model or not self.processor: return []
-        prompt = task + prompt_text
-        inputs = self.processor(text=prompt, images=pil_image, return_tensors="pt")
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        
-        generated_ids = self.model.generate(
-          input_ids=inputs["input_ids"],
-          pixel_values=inputs["pixel_values"],
-          max_new_tokens=1024,
-          num_beams=3
-        )
-        generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
-        parsed_answer = self.processor.post_process_generation(generated_text, task=task, image_size=pil_image.size)
-        
-        boxes = []
-        if task in parsed_answer:
-            result = parsed_answer[task]
-            if isinstance(result, dict):
-                if 'bboxes' in result:
-                    for bbox in result.get('bboxes', []):
-                        x1, y1, x2, y2 = bbox
-                        boxes.append({'x1': float(x1), 'y1': float(y1), 'x2': float(x2), 'y2': float(y2)})
-                elif 'polygons' in result:
-                    for polys, label in zip(result.get('polygons', []), result.get('labels', [])):
-                        for poly in polys:
-                            xs = poly[0::2]
-                            ys = poly[1::2]
-                            if not xs or not ys: continue
-                            x1, x2 = min(xs), max(xs)
-                            y1, y2 = min(ys), max(ys)
-                            boxes.append({'x1': float(x1), 'y1': float(y1), 'x2': float(x2), 'y2': float(y2)})
-        return boxes
-        
-    def run_test(self):
-        prompt = self.prompt_var.get().strip()
-        if not prompt: return
-        if not self.model: 
-            messagebox.showerror("Error", "Select a model first")
-            return
-        
-        try: n = int(self.test_n_var.get())
-        except: return
-        
-        self.save_history(prompt)
-        
-        paths = random.sample(self.annotator.image_paths, min(n, len(self.annotator.image_paths)))
-        
-        prog_win = tk.Toplevel(self)
-        prog_win.title("Testing...")
-        prog_win.geometry("300x100")
-        lbl = tk.Label(prog_win, text=f"Running inference on {len(paths)} images...", pady=20)
-        lbl.pack()
-        prog_win.update()
-        
-        results = []
-        for i, p in enumerate(paths):
-            lbl.config(text=f"Running inference {i+1}/{len(paths)}...")
-            prog_win.update()
-            img = Image.open(p).convert("RGB")
-            boxes = self._run_inference(img, prompt)
-            results.append((p, boxes))
-            
-        prog_win.destroy()
-        viewer = FlorenceTestViewer(self, results, self.annotator.classes)
-            
-    def annotate_dataset(self):
-        prompt = self.prompt_var.get().strip()
-        if not prompt: return
-        if not self.model: 
-            messagebox.showerror("Error", "Select a model first")
-            return
-        
-        self.save_history(prompt)
-        target_cls = int(self.target_class_var.get()) if self.target_class_var.get().isdigit() else 0
-        
-        threading.Thread(target=self._annotate_task, args=(prompt, target_cls), daemon=True).start()
-        
-    def _annotate_task(self, prompt, target_cls):
-        total = len(self.annotator.image_paths)
-        self.progress["maximum"] = total
-        self.progress["value"] = 0
-        
-        start_time = time.time()
-        
-        for i, p in enumerate(self.annotator.image_paths):
-            img = Image.open(p).convert("RGB")
-            w, h = img.size
-            new_boxes = self._run_inference(img, prompt)
-            
-            base = os.path.splitext(os.path.basename(p))[0]
-            lpath = os.path.join(self.annotator.label_out, base + ".txt")
-            
-            boxes = load_yolo_labels(lpath, w, h)
-            for nb in new_boxes:
-                nb['class'] = target_cls
-                boxes.append(nb)
-                
-            save_yolo_labels(lpath, boxes, w, h)
-            shutil.copy2(p, os.path.join(self.annotator.img_out, os.path.basename(p)))
-            
-            elapsed = time.time() - start_time
-            avg = elapsed / (i + 1)
-            rem = avg * (total - i - 1)
-            mins, secs = divmod(int(rem), 60)
-            
-            self.progress["value"] = i + 1
-            self.lbl_progress.config(text=f"Processed {i+1}/{total} - ETA: {mins}m {secs}s")
-            
-        self.lbl_progress.config(text="Done!")
-        self.annotator.load_image(self.annotator.index)
 
 class OpenVocabDialog(tk.Toplevel):
     def __init__(self, startup_gui):
