@@ -465,7 +465,8 @@ def match_box_via_template(prev_img_gray, curr_img_gray, box, search_margin=1.5)
     cx = (x1 + x2) // 2
     cy = (y1 + y2) // 2
     half_w = int(max(tw * search_margin, tw + 10))
-    half_h = int(max(th * search_margin, th + 10))
+    
+    _h = int(max(th * search_margin, th + 10))
     sx1 = max(0, cx - half_w)
     sy1 = max(0, cy - half_h)
     sx2 = min(curr_img_gray.shape[1], cx + half_w)
@@ -501,9 +502,11 @@ class AnnotatorApp:
         self.model = model_wrapper
         self.yolo_save_format = yolo_save_format
         self.sam3_config = sam3_config
+        self.last_delete_time = 0.0
         self.tracking_mode = False
 
-        os.makedirs(img_out, exist_ok=True)
+        if img_out:
+            os.makedirs(img_out, exist_ok=True)
         os.makedirs(label_out, exist_ok=True)
 
         exts = ("*.jpg", "*.png", "*.jpeg", "*.bmp")
@@ -571,6 +574,7 @@ class AnnotatorApp:
         self.root.bind("p", self.prev_image)
         self.root.bind("a", self.auto_annotate)
         self.root.bind("d", self.delete_box)
+        self.root.bind("<Control-Delete>", self.delete_frame_and_label)
         self.root.bind("<Control-s>", self.save_labels)
         self.root.bind("t", self.toggle_tracking)
         self.root.bind("g", self.toggle_segmentation)
@@ -626,6 +630,22 @@ class AnnotatorApp:
         progress = ttk.Progressbar(prog_win, orient="horizontal", length=350, mode="determinate")
         progress.pack(pady=10)
         
+        state = {"idx": 0, "path": "", "done": False, "msg": "Initializing SAM3...", "max": 0}
+        
+        def update_gui():
+            if not prog_win.winfo_exists(): return
+            if state["max"] > 0 and progress["maximum"] == 100: progress["maximum"] = state["max"]
+            progress["value"] = state["idx"]
+            if state["done"]:
+                lbl.config(text="Done!")
+                prog_win.after(500, prog_win.destroy)
+            else:
+                if state["path"]: lbl.config(text=f"Labeling {state['idx']} / {state['max']}\n{os.path.basename(state['path'])}")
+                else: lbl.config(text=state["msg"])
+                prog_win.after(30, update_gui)
+                
+        prog_win.after(30, update_gui)
+        
         def task():
             try:
                 import torch
@@ -635,8 +655,8 @@ class AnnotatorApp:
                 quant = self.sam3_config.get("quantization", "float16")
                 model_type = self.sam3_config.get("model_type", "SAM3")
                 
-                lbl.config(text=f"Loading {model_path} into memory...")
-                prog_win.update()
+                state["msg"] = f"Loading {os.path.basename(model_path)} into memory..."
+
                 
                 if model_type == "YOLOE":
                     from ultralytics import YOLO
@@ -653,8 +673,11 @@ class AnnotatorApp:
                     }
                     predictor = SAM3SemanticPredictor(overrides=overrides)
                 
+                from concurrent.futures import ThreadPoolExecutor
+                io_executor = ThreadPoolExecutor(max_workers=4)
+                
                 total = len(self.image_paths)
-                progress["maximum"] = total
+                state["max"] = total
                 
                 target_classes_str = self.sam3_config.get("target_classes", ",".join(self.classes))
                 try:
@@ -667,10 +690,17 @@ class AnnotatorApp:
                 chunks = build_chunks(mapping_dict, chunk_sz)
                 
                 for i, p in enumerate(self.image_paths):
-                    lbl.config(text=f"Labeling {i+1} / {total}\n{os.path.basename(p)}")
-                    img = Image.open(p).convert("RGB")
-                    
-                    w, h = img.size
+                    state["idx"] = i + 1
+                    state["path"] = p
+                        
+                    import cv2
+                    img = cv2.imread(p)
+                    if img is not None:
+                        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                        h, w = img.shape[:2]
+                    else:
+                        continue
+                        
                     boxes = []
                     
                     for chunk in chunks:
@@ -678,9 +708,9 @@ class AnnotatorApp:
                         with torch.no_grad():
                             if model_type == "YOLOE":
                                 predictor.set_classes(prompts)
-                                res = predictor(img, verbose=True)
+                                res = predictor(img, verbose=True, save=False)
                             else:
-                                res = predictor(img, text=prompts)
+                                res = predictor(img, text=prompts, verbose=True, save=False)
                             
                         for r in res:
                             has_masks = r.masks is not None
@@ -727,18 +757,17 @@ class AnnotatorApp:
                     base = os.path.splitext(os.path.basename(p))[0]
                     lpath = os.path.join(self.label_out, base + ".txt")
                     
-                    save_yolo_labels(lpath, boxes, w, h, save_format=self.yolo_save_format)
-                    shutil.copy2(p, os.path.join(self.img_out, os.path.basename(p)))
+                    def io_worker(l_path, n_boxes, width, height, fmt):
+                        save_yolo_labels(l_path, n_boxes, width, height, save_format=fmt)
+                        
+                    io_executor.submit(io_worker, lpath, boxes, w, h, self.yolo_save_format)
                     
-                    progress["value"] = i + 1
-                    prog_win.update()
-                    
-                lbl.config(text="Done!")
-                time.sleep(0.5)
+                io_executor.shutdown(wait=False)
             except Exception as e:
-                messagebox.showerror("SAM3 Error", str(e))
+                import traceback
+                traceback.print_exc()
             finally:
-                prog_win.destroy()
+                state["done"] = True
                 
                 # Cleanup VRAM
                 if 'predictor' in locals():
@@ -1149,30 +1178,49 @@ class AnnotatorApp:
         progress = ttk.Progressbar(prog_win, orient="horizontal", length=350, mode="determinate")
         progress.pack(pady=10)
         
+        state = {"idx": 0, "path": "", "done": False, "msg": "Initializing YOLO...", "max": 0}
+        
+        def update_gui():
+            if not prog_win.winfo_exists(): return
+            if state["max"] > 0 and progress["maximum"] == 100: progress["maximum"] = state["max"]
+            progress["value"] = state["idx"]
+            if state["done"]:
+                lbl.config(text="Done!")
+                prog_win.after(500, prog_win.destroy)
+            else:
+                if state["path"]: lbl.config(text=f"Labeling {state['idx']} / {state['max']}\n{os.path.basename(state['path'])}")
+                else: lbl.config(text=state["msg"])
+                prog_win.after(30, update_gui)
+                
+        prog_win.after(30, update_gui)
+        
         def task():
             try:
                 model_path = self.yolo_bulk_config.get("model_path")
                 conf_thresh = self.yolo_bulk_config.get("conf", 0.5)
                 mapping = self.yolo_bulk_config.get("mapping", {})
                 
-                lbl.config(text=f"Loading {os.path.basename(model_path)} into memory...")
-                prog_win.update()
+                state["msg"] = f"Loading {os.path.basename(model_path)} into memory..."
+
                 
                 model = YOLO(model_path)
                 
+                from concurrent.futures import ThreadPoolExecutor
+                io_executor = ThreadPoolExecutor(max_workers=4)
+                
                 total = len(self.image_paths)
-                progress["maximum"] = total
+                state["max"] = total
                 
                 for i, p in enumerate(self.image_paths):
-                    lbl.config(text=f"Labeling {i+1} / {total}\n{os.path.basename(p)}")
-                    img = Image.open(p).convert("RGB")
-                    w, h = img.size
+                    state["idx"] = i + 1
+                    state["path"] = p
                     
                     with torch.no_grad():
-                        res = model(img, conf=conf_thresh, verbose=False)
+                        res = model(p, conf=conf_thresh, verbose=True, save=False)
                         
                     new_boxes = []
                     r = res[0]
+                    h, w = r.orig_shape
                     has_masks = r.masks is not None
                     
                     if r.boxes:
@@ -1210,22 +1258,15 @@ class AnnotatorApp:
                     base = os.path.splitext(os.path.basename(p))[0]
                     lpath = os.path.join(self.label_out, base + ".txt")
                     
-                    existing_boxes = load_yolo_labels(lpath, w, h)
-                    
-                    # Merge existing boxes and new boxes
-                    for nb in new_boxes:
-                        existing_boxes.append(nb)
+                    def io_worker(l_path, n_boxes, width, height):
+                        e_boxes = load_yolo_labels(l_path, width, height)
+                        for nb in n_boxes:
+                            e_boxes.append(nb)
+                        save_yolo_labels(l_path, e_boxes, width, height)
                         
-                    save_yolo_labels(lpath, existing_boxes, w, h)
+                    io_executor.submit(io_worker, lpath, new_boxes, w, h)
                     
-                    import shutil
-                    shutil.copy2(p, os.path.join(self.img_out, os.path.basename(p)))
-                    
-                    progress["value"] = i + 1
-                    prog_win.update_idletasks()
-                    
-                lbl.config(text="Done!")
-                prog_win.destroy()
+                io_executor.shutdown(wait=False)
                 
                 del model
                 if 'torch' in sys.modules:
@@ -1236,7 +1277,8 @@ class AnnotatorApp:
             except Exception as e:
                 import traceback
                 traceback.print_exc()
-                lbl.config(text=f"Error: {e}")
+            finally:
+                state["done"] = True
                 
         import threading
         threading.Thread(target=task, daemon=True).start()
@@ -1251,7 +1293,8 @@ class AnnotatorApp:
                 b_copy["x1"], b_copy["y1"], b_copy["x2"], b_copy["y2"] = float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys))
             to_save.append(b_copy)
         save_yolo_labels(self.current_label_path(), to_save, self.img_w, self.img_h, save_format=self.yolo_save_format)
-        shutil.copy2(self.image_paths[self.index], self.current_image_out())
+        if self.img_out:
+            shutil.copy2(self.image_paths[self.index], self.current_image_out())
         print("Saved:", self.current_label_path())
 
     def filter_predictions_by_selected_classes(self, preds):
@@ -1408,6 +1451,46 @@ class AnnotatorApp:
                 self.save_state()
                 self.boxes.pop()
         self.redraw()
+
+    def delete_frame_and_label(self, event=None):
+        import time
+        if time.time() - self.last_delete_time < 0.350:  #ctrl del 350 mili second
+            return
+        self.last_delete_time = time.time()
+
+        if not self.image_paths:
+            return
+            
+        p = self.image_paths[self.index]
+        
+        # Delete image
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to delete image: {e}", parent=self.root)
+                
+        # Delete label
+        base = os.path.splitext(os.path.basename(p))[0]
+        lpath = os.path.join(self.label_out, base + ".txt")
+        if os.path.exists(lpath):
+            try:
+                os.remove(lpath)
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to delete label: {e}", parent=self.root)
+                
+        # Update state
+        self.image_paths.pop(self.index)
+        
+        if not self.image_paths:
+            messagebox.showinfo("Empty", "No more images left.", parent=self.root)
+            self.root.quit()
+            return
+            
+        if self.index >= len(self.image_paths):
+            self.index = len(self.image_paths) - 1
+            
+        self.load_image(self.index)
 
     def move_boxes(self, dx, dy):
         selected_indices = [i for i, b in enumerate(self.boxes) if b.get("selected", False)]
@@ -1690,6 +1773,9 @@ class VideoSplitterGUI:
         self.target_entry.pack(side=tk.LEFT)
         self.target_entry.bind("<KeyRelease>", lambda e: self.update_count())
 
+        self.fast_seek = tk.BooleanVar(value=True)
+        tk.Checkbutton(lf, text="Use fast seek (disable for HEVC corruption issues)", variable=self.fast_seek).pack(anchor="w", pady=5)
+
         btns = tk.Frame(self.root)
         btns.pack(fill=tk.X, padx=10, pady=5)
         tk.Button(btns, text="Analyze Video", command=self.analyze_video).pack(side=tk.LEFT, padx=5)
@@ -1772,8 +1858,7 @@ class VideoSplitterGUI:
             return
 
         cap = cv2.VideoCapture(self.video_path.get())
-        frame_no = int(np.random.choice(frames))
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+        # Grab first frame sequentially to avoid HEVC seeking corruption
         ret, frame = cap.read()
         cap.release()
 
@@ -1803,35 +1888,72 @@ class VideoSplitterGUI:
 
         cap = cv2.VideoCapture(self.video_path.get())
         total = len(frames)
-
+        
         self.progress["maximum"] = total
         self.progress["value"] = 0
-
         start_time = time.time()
+        
+        if self.fast_seek.get():
+            for i, frame_no in enumerate(frames):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+                ret, frame = cap.read()
+                if ret:
+                    cv2.imwrite(os.path.join(out, f"frame_{frame_no:06d}.jpg"), frame)
 
-        for i, frame_no in enumerate(frames):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
-            ret, frame = cap.read()
-            if ret:
-                cv2.imwrite(os.path.join(out, f"frame_{frame_no:06d}.jpg"), frame)
+                # 🔹 ETA
+                elapsed = time.time() - start_time
+                avg = elapsed / (i + 1)
+                remaining = avg * (total - i - 1)
+                mins, secs = divmod(int(remaining), 60)
+                self.eta_label.config(text=f"ETA: {mins:02d}:{secs:02d}")
 
-            # 🔹 ETA
-            elapsed = time.time() - start_time
-            avg = elapsed / (i + 1)
-            remaining = avg * (total - i - 1)
-            mins, secs = divmod(int(remaining), 60)
-            self.eta_label.config(text=f"ETA: {mins:02d}:{secs:02d}")
+                # 🔹 Live playback
+                if i % max(1, total // 30) == 0:
+                    self.show_preview_frame()
 
-            # 🔹 Live playback
-            if i % max(1, total // 30) == 0:
-                self.show_preview_frame()
+                self.progress["value"] = i + 1
+                self.root.update_idletasks()
+        else:
+            frames_set = set(frames)
+            max_frame = max(frames_set) if frames_set else 0
+            
+            current_frame = 0
+            extracted_count = 0
 
-            self.progress["value"] = i + 1
-            self.root.update_idletasks()
+            while True:
+                ret = cap.grab()
+                if not ret or current_frame > max_frame:
+                    break
+                    
+                if current_frame in frames_set:
+                    ret, frame = cap.retrieve()
+                    if not ret:
+                        break
+                    cv2.imwrite(os.path.join(out, f"frame_{current_frame:06d}.jpg"), frame)
+                    extracted_count += 1
+
+                    # 🔹 ETA
+                    elapsed = time.time() - start_time
+                    avg = elapsed / extracted_count
+                    remaining = avg * (total - extracted_count)
+                    mins, secs = divmod(int(remaining), 60)
+                    self.eta_label.config(text=f"ETA: {mins:02d}:{secs:02d}")
+
+                    # 🔹 Live playback
+                    if extracted_count % max(1, total // 30) == 0 or extracted_count == 1:
+                        preview = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        preview = cv2.resize(preview, (380, 210))
+                        img = ImageTk.PhotoImage(Image.fromarray(preview), master=self.root)
+                        self.preview_image = img
+                        self.preview_label.config(image=img)
+
+                    self.progress["value"] = extracted_count
+                    self.root.update_idletasks()
+                    
+                current_frame += 1
 
         cap.release()
         self.eta_label.config(text="ETA: 00:00")
-
         messagebox.showinfo("Done", f"Extracted {total} frames.")
 
 
@@ -1918,8 +2040,8 @@ class StartupGUI:
         model_p = self.model_path.get().strip()
         classes = [c.strip() for c in self.classes_str.get().split(",") if c.strip()]
 
-        if not images or not out_img or not out_label:
-            messagebox.showerror("Error", "Please select all required folders.")
+        if not images or not out_label:
+            messagebox.showerror("Error", "Please select Input Images and Output Labels folders.")
             return
 
         yolo_save_format = "bbox"
@@ -2203,7 +2325,7 @@ class StandardYoloDialog(tk.Toplevel):
                 for i, img_path in enumerate(img_paths):
                     img = Image.open(img_path).convert("RGB")
                     t0 = time.time()
-                    res = model(img, conf=conf, verbose=False)
+                    res = model(img, conf=conf, verbose=True, save=False)
                     t1 = time.time()
                     if i > 0 or len(img_paths) == 1:
                         total_elapsed += (t1 - t0)
@@ -2394,15 +2516,15 @@ class OpenVocabDialog(tk.Toplevel):
         f0 = tk.Frame(self)
         f0.pack(fill=tk.X, padx=10, pady=5)
         tk.Label(f0, text="Model Architecture:").pack(side=tk.LEFT)
-        self.model_type_var = tk.StringVar(value="YOLOE")
+        self.model_type_var = tk.StringVar(value="SAM3")
         def on_model_type_change():
             if self.model_type_var.get() == "YOLOE":
                 self.quant_var.set("float32")
             else:
                 self.quant_var.set("float16")
                 
-        tk.Radiobutton(f0, text="YOLOE", variable=self.model_type_var, value="YOLOE", command=on_model_type_change).pack(side=tk.LEFT, padx=5)
         tk.Radiobutton(f0, text="SAM3", variable=self.model_type_var, value="SAM3", command=on_model_type_change).pack(side=tk.LEFT, padx=5)
+        tk.Radiobutton(f0, text="YOLOE", variable=self.model_type_var, value="YOLOE", command=on_model_type_change).pack(side=tk.LEFT, padx=5)
 
         f1 = tk.Frame(self)
         f1.pack(fill=tk.X, padx=10, pady=5)
@@ -2435,7 +2557,7 @@ class OpenVocabDialog(tk.Toplevel):
         f3_6 = tk.Frame(self)
         f3_6.pack(fill=tk.X, padx=10, pady=5)
         tk.Label(f3_6, text="Chunk Size:").pack(side=tk.LEFT)
-        self.chunk_size_var = tk.StringVar(value="5")
+        self.chunk_size_var = tk.StringVar(value="10")
         tk.Spinbox(f3_6, from_=1, to=20, textvariable=self.chunk_size_var, width=5).pack(side=tk.LEFT, padx=5)
         self.global_resize_mult = 1.0
         self.global_shift_x = 0.0
@@ -2443,7 +2565,7 @@ class OpenVocabDialog(tk.Toplevel):
         f4 = tk.Frame(self)
         f4.pack(fill=tk.X, padx=10, pady=5)
         tk.Label(f4, text="Random Frames:").pack(side=tk.LEFT, padx=5)
-        self.test_n_var = tk.StringVar(value="3")
+        self.test_n_var = tk.StringVar(value="10")
         tk.Entry(f4, textvariable=self.test_n_var, width=5).pack(side=tk.LEFT, padx=5)
         tk.Button(f4, text="Test Inference", command=self.test_inference).pack(side=tk.LEFT)
         
@@ -2616,9 +2738,9 @@ class OpenVocabDialog(tk.Toplevel):
                         with torch.no_grad():
                             if model_type == "YOLOE":
                                 predictor.set_classes(prompts)
-                                res = predictor(img, verbose=False)
+                                res = predictor(img, verbose=True, save=False)
                             else:
-                                res = predictor(img, text=prompts)
+                                res = predictor(img, text=prompts, verbose=True, save=False)
                             
                         if res and hasattr(res[0], 'speed') and isinstance(res[0].speed, dict):
                             frame_elapsed += sum(res[0].speed.values()) / 1000.0
